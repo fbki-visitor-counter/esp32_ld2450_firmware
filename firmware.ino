@@ -2,6 +2,8 @@
 #include <FS.h>
 #include <LittleFS.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <PubSubClient.h>
 #include <ESPmDNS.h>
 #include <WebServer.h>
 #include <Update.h>
@@ -9,9 +11,18 @@
 
 WebServer server(80);
 
-const char *host = "esp32-webupdate";
+const char *host = "visitorcounter";
 const char* SSID = nullptr;
 const char* PASS = nullptr;
+
+const int mqtt_port = 8883;
+const char* mqtt_broker = "broker.emqx.io";
+
+const char* sensors_topic = nullptr; // To be filled
+const char* command_topic = nullptr; // To be filled
+
+WiFiClientSecure tls_client;
+PubSubClient mqtt_client(tls_client);
 
 enum {
   STARTUP,
@@ -100,6 +111,18 @@ int wifi_init() {
   return wifi_reconnect(200);
 }
 
+// Выцепить последние два байта из MAC адреса ESP
+String ap_ssid_id() {
+  uint8_t mac[6];
+
+  WiFi.softAPmacAddress(mac);
+
+  String mac_id = String(mac[4], HEX) +
+                  String(mac[5], HEX);
+
+  return mac_id;
+}
+
 // ====================================================================================================================
 // Real time
 // ====================================================================================================================
@@ -146,6 +169,92 @@ void ntp_init() {
 }
 
 // ====================================================================================================================
+// TLS
+// ====================================================================================================================
+static const char ca_cert[] PROGMEM = R"EOF(
+-----BEGIN CERTIFICATE-----
+MIIDjjCCAnagAwIBAgIQAzrx5qcRqaC7KGSxHQn65TANBgkqhkiG9w0BAQsFADBh
+MQswCQYDVQQGEwJVUzEVMBMGA1UEChMMRGlnaUNlcnQgSW5jMRkwFwYDVQQLExB3
+d3cuZGlnaWNlcnQuY29tMSAwHgYDVQQDExdEaWdpQ2VydCBHbG9iYWwgUm9vdCBH
+MjAeFw0xMzA4MDExMjAwMDBaFw0zODAxMTUxMjAwMDBaMGExCzAJBgNVBAYTAlVT
+MRUwEwYDVQQKEwxEaWdpQ2VydCBJbmMxGTAXBgNVBAsTEHd3dy5kaWdpY2VydC5j
+b20xIDAeBgNVBAMTF0RpZ2lDZXJ0IEdsb2JhbCBSb290IEcyMIIBIjANBgkqhkiG
+9w0BAQEFAAOCAQ8AMIIBCgKCAQEAuzfNNNx7a8myaJCtSnX/RrohCgiN9RlUyfuI
+2/Ou8jqJkTx65qsGGmvPrC3oXgkkRLpimn7Wo6h+4FR1IAWsULecYxpsMNzaHxmx
+1x7e/dfgy5SDN67sH0NO3Xss0r0upS/kqbitOtSZpLYl6ZtrAGCSYP9PIUkY92eQ
+q2EGnI/yuum06ZIya7XzV+hdG82MHauVBJVJ8zUtluNJbd134/tJS7SsVQepj5Wz
+tCO7TG1F8PapspUwtP1MVYwnSlcUfIKdzXOS0xZKBgyMUNGPHgm+F6HmIcr9g+UQ
+vIOlCsRnKPZzFBQ9RnbDhxSJITRNrw9FDKZJobq7nMWxM4MphQIDAQABo0IwQDAP
+BgNVHRMBAf8EBTADAQH/MA4GA1UdDwEB/wQEAwIBhjAdBgNVHQ4EFgQUTiJUIBiV
+5uNu5g/6+rkS7QYXjzkwDQYJKoZIhvcNAQELBQADggEBAGBnKJRvDkhj6zHd6mcY
+1Yl9PMWLSn/pvtsrF9+wX3N3KjITOYFnQoQj8kVnNeyIv/iPsGEMNKSuIEyExtv4
+NeF22d+mQrvHRAiGfzZ0JFrabA0UWTW98kndth/Jsw1HKj2ZL7tcu7XUIOGZX1NG
+Fdtom/DzMNU+MeKNhJ7jitralj41E6Vf8PlwUHBHQRFXGU7Aj64GxJUTFy8bJZ91
+8rGOmaFvE7FBcf6IKshPECBV1/MUReXgRPTqh5Uykw7+U0b6LJ3/iyK5S9kJRaTe
+pLiaWN0bfVKfjllDiIGknibVb63dDcY3fe0Dkhvld1927jyNxF1WW6LZZm6zNTfl
+MrY=
+-----END CERTIFICATE-----
+)EOF";
+
+// https://github.com/knolleary/pubsubclient/pull/851/files
+void tls_init() {
+  tls_client.setCACert(ca_cert); // TODO: Should one seed random first?
+}
+
+// ====================================================================================================================
+// MQTT
+// ====================================================================================================================
+void handle_message_fn(char* topic, byte* payload, unsigned int len) {
+  Serial.print("MQTT: message on topic ");
+  Serial.print(topic);
+  Serial.print(": ");
+}
+
+// Подключение или переподключение MQTT
+static void mqtt_reconnect() {
+  String client_id = "esp32_ld2450_" + ap_ssid_id();
+
+  if (mqtt_client.connect(client_id.c_str())) {
+    Serial.println("MQTT OK");
+  } else {
+    Serial.println("MQTT Fail");
+  }
+
+  mqtt_client.subscribe(command_topic);
+}
+
+// Первичный запуск MQTT
+void mqtt_init() {
+  Serial.print("MQTT startup\n");
+
+  String a = "axkuhta/esp32_ld2450_" + ap_ssid_id() + "/sensors";
+  String b = "axkuhta/esp32_ld2450_" + ap_ssid_id() + "/command";
+
+  sensors_topic = strdup( a.c_str() );
+  command_topic = strdup( b.c_str() );
+
+  mqtt_client.setServer(mqtt_broker, mqtt_port);
+  mqtt_client.setCallback(handle_message_fn);
+
+  mqtt_reconnect();
+
+  Serial.print("Command channel: ");
+  Serial.println(command_topic);
+  Serial.print("Sensors channel: ");
+  Serial.println(sensors_topic);
+}
+
+// No delay required
+// https://github.com/knolleary/pubsubclient/blob/master/examples/mqtt_esp8266/mqtt_esp8266.ino
+void mqtt_handle() {
+  if (!mqtt_client.connected()) {
+    mqtt_reconnect();
+  }
+
+  mqtt_client.loop();
+}
+
+// ====================================================================================================================
 // Device setup
 // ====================================================================================================================
 
@@ -178,6 +287,10 @@ static const char root_page[] = R"===(
 			background-color: #E88F00;
 			color: #00305B;
 		}
+
+    input {
+      font-size: inherit;
+    }
 
 		.container {
 			max-width: 48rem;
@@ -327,6 +440,8 @@ void setup() {
 
   http_server_init();
   ntp_init();
+  tls_init();
+  mqtt_init();
 }
 
 // ====================================================================================================================
@@ -517,6 +632,40 @@ void handle_latest_frame() {
   }
 }
 
+void publish_visitors() {
+  char* buf = (char*)malloc(512);
+  char* ts = timestamp();
+
+  int visitors_l = sm1.count_l + sm2.count_l + sm3.count_l;
+  int visitors_r = sm1.count_r + sm2.count_r + sm3.count_r;
+
+  const char* fmt_str = 
+R"===({
+  "device_timestamp": "%s",
+  "visitors_l": %d,
+  "visitors_r": %d
+})===";
+
+  snprintf(buf, 512, fmt_str, ts, visitors_l, visitors_r);
+
+  Serial.println(buf);
+
+  bool success = mqtt_client.publish(sensors_topic, buf);
+  Serial.println(success);
+
+  free(ts);
+  free(buf);
+}
+
+void visitors_handle() {
+  static uint32_t publish_at;
+
+  if (millis() >= publish_at) {
+    publish_visitors();
+    publish_at += 10000;
+  }
+}
+
 void handle_led() {
   switch (system_state) {
     case STARTUP:
@@ -535,4 +684,9 @@ void loop() {
   handle_led();
   handle_latest_frame();
   server.handleClient();
+
+  if (WiFi.status() == WL_CONNECTED) {
+    visitors_handle();
+    mqtt_handle();
+  }
 }
