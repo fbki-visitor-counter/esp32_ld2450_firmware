@@ -427,21 +427,13 @@ void setup() {
   littlefs_init();
 
   if (!read_credentials()) {
-    device_setup();
+    transition_to_setup();
     http_server_init();
     return;
   }
 
-  if (!wifi_init()) {
-    device_setup();
-    http_server_init();
-    return;
-  }
-
-  http_server_init();
-  ntp_init();
-  tls_init();
-  mqtt_init();
+  WiFi.begin(SSID, PASS);
+  system_state = STARTUP;
 }
 
 // ====================================================================================================================
@@ -680,13 +672,54 @@ void handle_led() {
   }
 }
 
+#define WIFI_GRACE_PERIOD 20000
+uint32_t wifi_last_ok = 0;
+
+void transition_to_setup() {
+  WiFi.softAP("ESP32-LD2450");
+  system_state = DEVICE_SETUP;
+}
+
 void loop() {
+  if (WiFi.status() == WL_CONNECTED)
+    wifi_last_ok = millis();
+
+  bool long_time_no_wifi = millis() > wifi_last_ok + WIFI_GRACE_PERIOD;
+
+  switch (system_state) {
+    case NORMAL_OPERATION:
+      if (long_time_no_wifi) {
+        transition_to_setup();
+      } else {
+        server.handleClient();
+        visitors_handle();
+        mqtt_handle();
+      }
+      break;
+    case DEVICE_SETUP:
+      if (WiFi.status() == WL_CONNECTED) {
+        WiFi.softAPdisconnect(true);
+        system_state = NORMAL_OPERATION;
+      } else {
+        server.handleClient();
+      }
+      break;
+    case STARTUP:
+      if (WiFi.status() == WL_CONNECTED) {
+        http_server_init();
+        ntp_init();
+        tls_init();
+        mqtt_init();
+        system_state = NORMAL_OPERATION;
+      } else {
+        if (long_time_no_wifi) {
+          transition_to_setup();
+          http_server_init();
+        }
+      }
+      break;
+  }
+
   handle_led();
   handle_latest_frame();
-  server.handleClient();
-
-  if (WiFi.status() == WL_CONNECTED) {
-    visitors_handle();
-    mqtt_handle();
-  }
 }
