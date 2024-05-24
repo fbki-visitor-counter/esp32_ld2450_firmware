@@ -90,6 +90,196 @@ void save_credentials(String ssid_, String pass_) {
 }
 
 // ====================================================================================================================
+// LD2450
+// ====================================================================================================================
+
+HardwareSerial radar_uart(1);
+
+// https://github.com/espressif/arduino-esp32/blob/master/libraries/ESP32/examples/Serial/OnReceive_Demo/OnReceive_Demo.ino
+void radar_init() {
+  pinMode(16, INPUT);
+  pinMode(18, OUTPUT);
+
+  radar_uart.begin(256000, SERIAL_8N1, 16, 18); // RX, TX
+  radar_uart.setRxFIFOFull(127);
+  radar_uart.onReceive(handle_radar_uart, false);
+}
+
+void handle_radar_uart(void) {
+  if (radar_uart.available() == 127) {
+    // Overrun... do nothing
+  }
+
+  // Unknown or truncated frame - skip
+  if (radar_uart.available() != 30) {
+    while (radar_uart.available())
+      radar_uart.read();
+
+    return;
+  }
+
+  read_ld2450_frame();
+}
+
+typedef struct target_t {
+    int16_t x;
+    int16_t y;
+    int16_t speed;
+    uint16_t resolution;
+} target_t;
+
+typedef struct frame_t {
+  target_t targets[3];
+  double ts;
+} frame_t;
+
+frame_t latest_frame = {0}; // Singular frame used for immediate serial output to a PC
+uint32_t dropped_frames = 0; // LD2450 frames dropped because of main loop not keeping up
+
+void read_ld2450_frame() {
+  char frame[30] = {0};
+
+  radar_uart.read(frame, 30);
+
+  bool head_valid = frame[0] == 0xAA and frame[1] == 0xFF and frame[2] == 0x03 and frame[3] == 0x00;
+  bool tail_valid = frame[28] == 0x55 and frame[29] == 0xCC;
+
+  if (not head_valid or not tail_valid)
+    return;
+
+  if (latest_frame.ts) {
+    dropped_frames++;
+    return;
+  }
+
+  latest_frame.ts = frac_time();
+
+  for (int i = 0; i < 3; i++) {
+    uint16_t x_ = frame[4 + 8*i + 0] + frame[4 + 8*i + 1]*256;
+    uint16_t y_ = frame[4 + 8*i + 2] + frame[4 + 8*i + 3]*256;
+    uint16_t speed_ = frame[4 + 8*i + 4] + frame[4 + 8*i + 5]*256;
+    uint16_t d_resolution_ = frame[4 + 8*i + 6] + frame[4 + 8*i + 7]*256;
+
+    // LD2450 uses a custom signed number format
+    latest_frame.targets[i].x = x_ & 0x8000 ? x_ - 0x8000 : -x_;
+    latest_frame.targets[i].y = y_ & 0x8000 ? y_ - 0x8000 : -y_;
+    latest_frame.targets[i].speed = speed_ & 0x8000 ? speed_ - 0x8000 : -speed_;
+    latest_frame.targets[i].resolution = d_resolution_;
+  }
+}
+
+class CounterStateMachine {
+public:
+  enum {
+    IDLE,
+    ALERT
+  } state = IDLE;
+
+  uint32_t state_ttl = 0;
+
+  uint32_t count_r = 0;
+  uint32_t count_l = 0;
+  
+  // x(t - 1)
+  // v(t - 1)
+  int16_t x_ = 0;
+  int16_t v_ = 0;
+
+  void transition_to_idle() {
+    state = IDLE;
+    state_ttl = 0;
+  }
+
+  void transition_to_alert() {
+    state = ALERT;
+    state_ttl = 10;
+  }
+
+  void r_event() {
+    transition_to_idle();
+    count_r++;
+  }
+
+  void l_event() {
+    transition_to_idle();
+    count_l++;
+  }
+
+  void advance(int16_t x, int16_t v) {
+    bool vz = v_ < 0 and v >= 0;
+    bool xz_r = x_ < 0 and x >= 0;
+    bool xz_l = x < 0 and x_ >= 0;
+
+    if (vz) transition_to_alert();
+
+    if (state == ALERT) {
+      if (xz_r) r_event();
+      if (xz_l) l_event();
+
+      if (state_ttl == 0) {
+        transition_to_idle();
+      } else {
+        state_ttl--;
+      }
+    }
+
+    x_ = x;
+    v_ = v;
+  }
+};
+
+CounterStateMachine sm1;
+CounterStateMachine sm2;
+CounterStateMachine sm3;
+
+CounterStateMachine machines[] = {sm1, sm2, sm3};
+
+void print_state_machines() {
+  for (int i = 0; i < 3; i++) {
+    Serial.printf(" ==== Machine %d ==== \r\n", i);
+    Serial.printf(" Left:  %d\r\n", machines[i].count_l);
+    Serial.printf(" Right: %d\r\n", machines[i].count_r);
+  }
+}
+
+void bent_pipe(Stream& a, Stream& b) {
+  if (radar_uart.available())
+   Serial.println(radar_uart.read(), HEX);
+
+  if (Serial.available())
+   radar_uart.write(Serial.read());
+}
+
+void handle_latest_frame() {
+  if (latest_frame.ts) {
+    nc_tcp_enqueue_frame(latest_frame);
+
+    Serial.print(latest_frame.ts, 4);
+    Serial.print(",");
+
+    for (int i = 0; i < 3; i++) {
+      Serial.print(latest_frame.targets[i].x);
+      Serial.print(",");
+
+      Serial.print(latest_frame.targets[i].y);
+      Serial.print(",");
+
+      Serial.print(latest_frame.targets[i].speed);
+      Serial.print(",");
+
+      Serial.print(latest_frame.targets[i].resolution);
+      Serial.print(i < 2 ? "," : "\r\n");
+
+      machines[i].advance(latest_frame.targets[i].x, latest_frame.targets[i].speed);
+    }
+
+    latest_frame.ts = 0;
+
+    //print_state_machines();
+  }
+}
+
+// ====================================================================================================================
 // WiFi
 // ====================================================================================================================
 int wifi_reconnect(int grace_period) {
@@ -215,9 +405,9 @@ static void mqtt_reconnect() {
   String client_id = "esp32_ld2450_" + ap_ssid_id();
 
   if (mqtt_client.connect(client_id.c_str())) {
-    Serial.println("MQTT OK");
+    //Serial.println("MQTT OK");
   } else {
-    Serial.println("MQTT Fail");
+    //Serial.println("MQTT Fail");
   }
 
   mqtt_client.subscribe(command_topic);
@@ -252,6 +442,74 @@ void mqtt_handle() {
   }
 
   mqtt_client.loop();
+}
+
+// ====================================================================================================================
+// Netcat radar data server
+// ====================================================================================================================
+
+#define MAX_NC_CLIENTS 4
+
+WiFiServer nc_tcp_server(8021, MAX_NC_CLIENTS);
+
+struct nc_client_t {
+  WiFiClient socket;
+  frame_t pending_frame;
+} nc_clients[MAX_NC_CLIENTS];
+
+void nc_tcp_init() {
+  nc_tcp_server.begin();
+  //nc_tcp_server.setTimeout(0);
+}
+
+void nc_tcp_accept_all() {
+  WiFiClient client = nc_tcp_server.accept();
+
+  if (client.connected()) {
+    for (int i = 0; i < MAX_NC_CLIENTS; i++) {
+      if (!nc_clients[i].socket.connected()) {
+        client.printf("time,x1,y1,v1,r1,x2,y2,v2,r2,x3,y3,v3,r3\n");
+        nc_clients[i].socket = client;
+        return;
+      }
+    }
+
+    client.printf("No slots available, sorry\n");
+    client.stop();
+  }
+}
+
+void nc_tcp_handle() {
+  nc_tcp_accept_all();
+
+  for (int i = 0; i < MAX_NC_CLIENTS; i++) {
+    WiFiClient client = nc_clients[i].socket;
+
+    if (nc_clients[i].pending_frame.ts == 0.0)
+      continue;
+
+    frame_t frame = nc_clients[i].pending_frame;
+
+    if (client.connected()) {
+      client.printf("%lf,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",  frame.ts,
+                                                                  frame.targets[0].x, frame.targets[0].y, frame.targets[0].speed, frame.targets[0].resolution,
+                                                                  frame.targets[1].x, frame.targets[1].y, frame.targets[1].speed, frame.targets[1].resolution,
+                                                                  frame.targets[2].x, frame.targets[2].y, frame.targets[2].speed, frame.targets[2].resolution );
+    } else {
+      client.stop();
+    }
+
+    nc_clients[i].pending_frame.ts = 0.0;
+  }
+}
+
+void nc_tcp_enqueue_frame(struct frame_t frame) {
+  for (int i = 0; i < MAX_NC_CLIENTS; i++) {
+    if (nc_clients[i].pending_frame.ts)
+      continue;
+
+    nc_clients[i].pending_frame = frame;
+  }
 }
 
 // ====================================================================================================================
@@ -429,199 +687,12 @@ void setup() {
   if (!read_credentials()) {
     transition_to_setup();
     http_server_init();
+    nc_tcp_init();
     return;
   }
 
   WiFi.begin(SSID, PASS);
   system_state = STARTUP;
-}
-
-// ====================================================================================================================
-// LD2450
-// ====================================================================================================================
-
-HardwareSerial radar_uart(1);
-
-// https://github.com/espressif/arduino-esp32/blob/master/libraries/ESP32/examples/Serial/OnReceive_Demo/OnReceive_Demo.ino
-void radar_init() {
-  pinMode(16, INPUT);
-  pinMode(18, OUTPUT);
-
-  radar_uart.begin(256000, SERIAL_8N1, 16, 18); // RX, TX
-  radar_uart.setRxFIFOFull(127);
-  radar_uart.onReceive(handle_radar_uart, false);
-}
-
-void handle_radar_uart(void) {
-  if (radar_uart.available() == 127) {
-    // Overrun... do nothing
-  }
-
-  // Unknown or truncated frame - skip
-  if (radar_uart.available() != 30) {
-    while (radar_uart.available())
-      radar_uart.read();
-
-    return;
-  }
-
-  read_ld2450_frame();
-}
-
-typedef struct target {
-    int16_t x;
-    int16_t y;
-    int16_t speed;
-    uint16_t resolution;
-} target_t;
-
-typedef struct frame {
-  target_t targets[3];
-  double ts;
-} frame_t;
-
-frame_t latest_frame = {0}; // Singular frame used for immediate serial output to a PC
-uint32_t dropped_frames = 0; // LD2450 frames dropped because of main loop not keeping up
-
-void read_ld2450_frame() {
-  char frame[30] = {0};
-
-  radar_uart.read(frame, 30);
-
-  bool head_valid = frame[0] == 0xAA and frame[1] == 0xFF and frame[2] == 0x03 and frame[3] == 0x00;
-  bool tail_valid = frame[28] == 0x55 and frame[29] == 0xCC;
-
-  if (not head_valid or not tail_valid)
-    return;
-
-  if (latest_frame.ts) {
-    dropped_frames++;
-    return;
-  }
-
-  latest_frame.ts = frac_time();
-
-  for (int i = 0; i < 3; i++) {
-    uint16_t x_ = frame[4 + 8*i + 0] + frame[4 + 8*i + 1]*256;
-    uint16_t y_ = frame[4 + 8*i + 2] + frame[4 + 8*i + 3]*256;
-    uint16_t speed_ = frame[4 + 8*i + 4] + frame[4 + 8*i + 5]*256;
-    uint16_t d_resolution_ = frame[4 + 8*i + 6] + frame[4 + 8*i + 7]*256;
-
-    // LD2450 uses a custom signed number format
-    latest_frame.targets[i].x = x_ & 0x8000 ? x_ - 0x8000 : -x_;
-    latest_frame.targets[i].y = y_ & 0x8000 ? y_ - 0x8000 : -y_;
-    latest_frame.targets[i].speed = speed_ & 0x8000 ? speed_ - 0x8000 : -speed_;
-    latest_frame.targets[i].resolution = d_resolution_;
-  }
-}
-
-class CounterStateMachine {
-public:
-  enum {
-    IDLE,
-    ALERT
-  } state = IDLE;
-
-  uint32_t state_ttl = 0;
-
-  uint32_t count_r = 0;
-  uint32_t count_l = 0;
-  
-  // x(t - 1)
-  // v(t - 1)
-  int16_t x_ = 0;
-  int16_t v_ = 0;
-
-  void transition_to_idle() {
-    state = IDLE;
-    state_ttl = 0;
-  }
-
-  void transition_to_alert() {
-    state = ALERT;
-    state_ttl = 10;
-  }
-
-  void r_event() {
-    transition_to_idle();
-    count_r++;
-  }
-
-  void l_event() {
-    transition_to_idle();
-    count_l++;
-  }
-
-  void advance(int16_t x, int16_t v) {
-    bool vz = v_ < 0 and v >= 0;
-    bool xz_r = x_ < 0 and x >= 0;
-    bool xz_l = x < 0 and x_ >= 0;
-
-    if (vz) transition_to_alert();
-
-    if (state == ALERT) {
-      if (xz_r) r_event();
-      if (xz_l) l_event();
-
-      if (state_ttl == 0) {
-        transition_to_idle();
-      } else {
-        state_ttl--;
-      }
-    }
-
-    x_ = x;
-    v_ = v;
-  }
-};
-
-CounterStateMachine sm1;
-CounterStateMachine sm2;
-CounterStateMachine sm3;
-
-CounterStateMachine machines[] = {sm1, sm2, sm3};
-
-void print_state_machines() {
-  for (int i = 0; i < 3; i++) {
-    Serial.printf(" ==== Machine %d ==== \r\n", i);
-    Serial.printf(" Left:  %d\r\n", machines[i].count_l);
-    Serial.printf(" Right: %d\r\n", machines[i].count_r);
-  }
-}
-
-void bent_pipe(Stream& a, Stream& b) {
-  if (radar_uart.available())
-   Serial.println(radar_uart.read(), HEX);
-
-  if (Serial.available())
-   radar_uart.write(Serial.read());
-}
-
-void handle_latest_frame() {
-  if (latest_frame.ts) { 
-    Serial.print(latest_frame.ts, 4);
-    Serial.print(",");
-
-    for (int i = 0; i < 3; i++) {
-      Serial.print(latest_frame.targets[i].x);
-      Serial.print(",");
-
-      Serial.print(latest_frame.targets[i].y);
-      Serial.print(",");
-
-      Serial.print(latest_frame.targets[i].speed);
-      Serial.print(",");
-
-      Serial.print(latest_frame.targets[i].resolution);
-      Serial.print(i < 2 ? "," : "\r\n");
-
-      machines[i].advance(latest_frame.targets[i].x, latest_frame.targets[i].speed);
-    }
-
-    latest_frame.ts = 0;
-
-    //print_state_machines();
-  }
 }
 
 void publish_visitors() {
@@ -692,6 +763,7 @@ void loop() {
         transition_to_setup();
       } else {
         server.handleClient();
+        nc_tcp_handle();
         visitors_handle();
         mqtt_handle();
       }
@@ -702,11 +774,13 @@ void loop() {
         system_state = NORMAL_OPERATION;
       } else {
         server.handleClient();
+        nc_tcp_handle();
       }
       break;
     case STARTUP:
       if (WiFi.status() == WL_CONNECTED) {
         http_server_init();
+        nc_tcp_init();
         ntp_init();
         tls_init();
         mqtt_init();
@@ -715,6 +789,7 @@ void loop() {
         if (long_time_no_wifi) {
           transition_to_setup();
           http_server_init();
+          nc_tcp_init();
         }
       }
       break;
