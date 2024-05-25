@@ -175,68 +175,51 @@ public:
     ALERT
   } state = IDLE;
 
-  uint32_t state_ttl = 0;
-
-  uint32_t count_r = 0;
+  uint32_t count_u = 0;
+  uint32_t count_d = 0;
   uint32_t count_l = 0;
-  
-  // x(t - 1)
-  // v(t - 1)
-  int16_t x_ = 0;
-  int16_t v_ = 0;
+  uint32_t count_r = 0;
 
-  void transition_to_idle() {
-    state = IDLE;
-    state_ttl = 0;
-  }
+  void advance(int16_t x_, int16_t y_) {
+    double x = double(x_) / 1000.0;
+    double y = double(y_) / 1000.0;
 
-  void transition_to_alert() {
-    state = ALERT;
-    state_ttl = 10;
-  }
-
-  void r_event() {
-    transition_to_idle();
-    count_r++;
-  }
-
-  void l_event() {
-    transition_to_idle();
-    count_l++;
-  }
-
-  void advance(int16_t x, int16_t v) {
-    bool vz = v_ < 0 and v >= 0;
-    bool xz_r = x_ < 0 and x >= 0;
-    bool xz_l = x < 0 and x_ >= 0;
-
-    if (vz) transition_to_alert();
-
-    if (state == ALERT) {
-      if (xz_r) r_event();
-      if (xz_l) l_event();
-
-      if (state_ttl == 0) {
-        transition_to_idle();
-      } else {
-        state_ttl--;
-      }
+    switch (state) {
+      case IDLE:
+        if (x >= -.5 and x <= .5 and y >= .2 and y <= 2.0) {
+          state = ALERT;
+        }
+        break;
+      case ALERT:
+        if (y < .2) {
+          count_u++;
+          state = IDLE;
+        } else if (y > 2.0) {
+          count_d++;
+          state = IDLE;
+        } else if (x < -.5) {
+          count_l++;
+          state = IDLE;
+        } else if (x > .5) {
+          count_r++;
+          state = IDLE;
+        }
+        break;
     }
-
-    x_ = x;
-    v_ = v;
   }
 };
 
-CounterStateMachine sm1;
-CounterStateMachine sm2;
-CounterStateMachine sm3;
-
-CounterStateMachine machines[] = {sm1, sm2, sm3};
+CounterStateMachine machines[] = {
+  CounterStateMachine(),
+  CounterStateMachine(),
+  CounterStateMachine()
+};
 
 void print_state_machines() {
   for (int i = 0; i < 3; i++) {
     Serial.printf(" ==== Machine %d ==== \r\n", i);
+    Serial.printf(" Up:    %d\r\n", machines[i].count_u);
+    Serial.printf(" Down:  %d\r\n", machines[i].count_d);
     Serial.printf(" Left:  %d\r\n", machines[i].count_l);
     Serial.printf(" Right: %d\r\n", machines[i].count_r);
   }
@@ -270,7 +253,7 @@ void handle_latest_frame() {
       Serial.print(latest_frame.targets[i].resolution);
       Serial.print(i < 2 ? "," : "\r\n");
 
-      machines[i].advance(latest_frame.targets[i].x, latest_frame.targets[i].speed);
+      machines[i].advance(latest_frame.targets[i].x, latest_frame.targets[i].y);
     }
 
     latest_frame.ts = 0;
@@ -699,17 +682,21 @@ void publish_visitors() {
   char* buf = (char*)malloc(512);
   char* ts = timestamp();
 
-  int visitors_l = sm1.count_l + sm2.count_l + sm3.count_l;
-  int visitors_r = sm1.count_r + sm2.count_r + sm3.count_r;
+  int visitors_u = machines[0].count_u + machines[1].count_u + machines[2].count_u;
+  int visitors_d = machines[0].count_d + machines[1].count_d + machines[2].count_d;
+  int visitors_l = machines[0].count_l + machines[1].count_l + machines[2].count_l;
+  int visitors_r = machines[0].count_r + machines[1].count_r + machines[2].count_r;
 
   const char* fmt_str = 
 R"===({
   "device_timestamp": "%s",
+  "visitors_u": %d,
+  "visitors_d": %d,
   "visitors_l": %d,
   "visitors_r": %d
 })===";
 
-  snprintf(buf, 512, fmt_str, ts, visitors_l, visitors_r);
+  snprintf(buf, 512, fmt_str, ts, visitors_u, visitors_d, visitors_l, visitors_r);
 
   Serial.println(buf);
 
