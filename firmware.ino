@@ -9,9 +9,18 @@
 #include <Update.h>
 #include <time.h>
 
+// https://github.com/richgel999/miniz/blob/master/examples/example5.c
+#define MINIZ_NO_STDIO
+#define MINIZ_NO_ARCHIVE_APIS
+#define MINIZ_NO_TIME
+#define MINIZ_NO_ZLIB_APIS
+#define MINIZ_NO_MALLOC
+#define TDEFL_LESS_MEMORY 1
+#include "miniz.h"
+
 WebServer server(80);
 
-const char *host = "visitorcounter";
+const char *host = nullptr; // To be filled - "esp32_ld2450_MMMM"
 const char* SSID = nullptr;
 const char* PASS = nullptr;
 
@@ -20,6 +29,8 @@ const char* mqtt_broker = "broker.emqx.io";
 
 const char* sensors_topic = nullptr; // To be filled
 const char* command_topic = nullptr; // To be filled
+const char* rawdata_topic = nullptr; // To be filled
+const char* telemetry_topic = nullptr; // To be filled
 
 WiFiClientSecure tls_client;
 PubSubClient mqtt_client(tls_client);
@@ -29,6 +40,17 @@ enum {
   DEVICE_SETUP,
   NORMAL_OPERATION
 } system_state = NORMAL_OPERATION;
+
+String device_id() {
+  uint8_t mac[6];
+
+  WiFi.softAPmacAddress(mac);
+
+  String mac_id = String(mac[4], HEX) +
+                  String(mac[5], HEX);
+
+  return String("esp32_ld2450_") + mac_id;
+}
 
 // ====================================================================================================================
 // Non-volatile memory
@@ -236,6 +258,7 @@ void bent_pipe(Stream& a, Stream& b) {
 void handle_latest_frame() {
   if (latest_frame.ts) {
     nc_tcp_enqueue_frame(latest_frame);
+    miniz_enqueue_frame(latest_frame);
 
     Serial.print(latest_frame.ts, 4);
     Serial.print(",");
@@ -284,18 +307,6 @@ int wifi_init() {
   return wifi_reconnect(200);
 }
 
-// Выцепить последние два байта из MAC адреса ESP
-String ap_ssid_id() {
-  uint8_t mac[6];
-
-  WiFi.softAPmacAddress(mac);
-
-  String mac_id = String(mac[4], HEX) +
-                  String(mac[5], HEX);
-
-  return mac_id;
-}
-
 // ====================================================================================================================
 // Real time
 // ====================================================================================================================
@@ -334,11 +345,80 @@ void ntp_init() {
   time_t now = time(nullptr);
   while (now < 8 * 3600 * 2) {
     now = time(nullptr);
-    delay(100);
+    delay(0);
   }
 
   Serial.print("Current time: ");
   print_time();
+}
+
+// ====================================================================================================================
+// MiniZ
+// ====================================================================================================================
+
+#define FRAMES_IN_BLOCK 20
+#define BLOCK_SIZE_LIMIT 1024
+
+tdefl_compressor* p_deflator = nullptr;
+
+void miniz_init() {
+  p_deflator = (tdefl_compressor*)ps_malloc(sizeof(tdefl_compressor));
+  miniz_reset();
+}
+
+void miniz_reset() {
+  static mz_uint s_tdefl_num_probes[11] = { 0, 1, 6, 32, 16, 32, 128, 256, 512, 768, 1500 };
+
+  int level = 3;
+
+  mz_uint comp_flags = TDEFL_WRITE_ZLIB_HEADER | s_tdefl_num_probes[MZ_MIN(10, level)] | ((level <= 3) ? TDEFL_GREEDY_PARSING_FLAG : 0);
+
+  tdefl_init(p_deflator, NULL, NULL, comp_flags);
+}
+
+void miniz_enqueue_frame(struct frame_t frame) {
+  static int frames_placed = 0;
+  static size_t avail_out;
+  static char* dst;
+  static char* next_out;
+  char src[256] = {0};
+
+  if (!dst) {
+    avail_out = BLOCK_SIZE_LIMIT;
+    dst = (char*)malloc(BLOCK_SIZE_LIMIT);
+    next_out = dst;
+  }
+  
+  snprintf(src, 255, "%lf,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", frame.ts,
+                                                                  frame.targets[0].x, frame.targets[0].y, frame.targets[0].speed, frame.targets[0].resolution,
+                                                                  frame.targets[1].x, frame.targets[1].y, frame.targets[1].speed, frame.targets[1].resolution,
+                                                                  frame.targets[2].x, frame.targets[2].y, frame.targets[2].speed, frame.targets[2].resolution );
+
+  size_t avail_in = strlen(src);
+  size_t out_bytes = avail_out;
+
+  tdefl_status status = tdefl_compress(p_deflator, src, &avail_in, next_out, &out_bytes, frames_placed < (FRAMES_IN_BLOCK - 1) ? TDEFL_NO_FLUSH : TDEFL_FINISH);
+
+  next_out += out_bytes;
+  avail_out -= out_bytes;
+
+  frames_placed++;
+
+  if (frames_placed == FRAMES_IN_BLOCK) {
+    if (status == TDEFL_STATUS_DONE) {
+      size_t size = BLOCK_SIZE_LIMIT - avail_out;
+      mqtt_client.publish(rawdata_topic, (uint8_t*)dst, size, true);
+    } else {
+      mqtt_client.publish(telemetry_topic, "compression error");
+    }
+
+    free(dst);
+
+    dst = nullptr;
+
+    miniz_reset();
+    frames_placed = 0;
+  }
 }
 
 // ====================================================================================================================
@@ -385,10 +465,10 @@ void handle_message_fn(char* topic, byte* payload, unsigned int len) {
 
 // Подключение или переподключение MQTT
 static void mqtt_reconnect() {
-  String client_id = "esp32_ld2450_" + ap_ssid_id();
+  String client_id = device_id();
 
   if (mqtt_client.connect(client_id.c_str())) {
-    //Serial.println("MQTT OK");
+    mqtt_client.publish(telemetry_topic, "hello");
   } else {
     //Serial.println("MQTT Fail");
   }
@@ -400,14 +480,19 @@ static void mqtt_reconnect() {
 void mqtt_init() {
   Serial.print("MQTT startup\n");
 
-  String a = "axkuhta/esp32_ld2450_" + ap_ssid_id() + "/sensors";
-  String b = "axkuhta/esp32_ld2450_" + ap_ssid_id() + "/command";
+  String a = "axkuhta/" + device_id() + "/sensors";
+  String b = "axkuhta/" + device_id() + "/command";
+  String c = "axkuhta/" + device_id() + "/rawdata";
+  String d = "axkuhta/" + device_id() + "/telemetry";
 
   sensors_topic = strdup( a.c_str() );
   command_topic = strdup( b.c_str() );
+  rawdata_topic = strdup( c.c_str() );
+  telemetry_topic = strdup( d.c_str() );
 
   mqtt_client.setServer(mqtt_broker, mqtt_port);
   mqtt_client.setCallback(handle_message_fn);
+  mqtt_client.setBufferSize(BLOCK_SIZE_LIMIT); // To fit larger gzip messages
 
   mqtt_reconnect();
 
@@ -415,6 +500,10 @@ void mqtt_init() {
   Serial.println(command_topic);
   Serial.print("Sensors channel: ");
   Serial.println(sensors_topic);
+  Serial.print("Rawdata channel: ");
+  Serial.println(rawdata_topic);
+  Serial.print("Telemetry channel: ");
+  Serial.println(telemetry_topic);
 }
 
 // No delay required
@@ -613,6 +702,7 @@ void handle_update() {
 
 void handle_update_upload() {
   HTTPUpload &upload = server.upload();
+  WiFi.setSleep(false); // Faster upload
   
   if (upload.status == UPLOAD_FILE_START) {
     Serial.setDebugOutput(true);
@@ -624,6 +714,7 @@ void handle_update_upload() {
     if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
       Update.printError(Serial);
     }
+    Serial.printf("%u bytes\n", upload.totalSize);
   } else if (upload.status == UPLOAD_FILE_END) {
     if (Update.end(true)) {  //true to set the size to the current progress
       Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
@@ -637,16 +728,19 @@ void handle_update_upload() {
 }
 
 void http_server_init() {
-  MDNS.begin(host);
-
   server.on("/", handle_root);
   server.on("/api/setup", handle_setup);
   server.on("/api/update", HTTP_POST, handle_update, handle_update_upload);
 
   server.onNotFound(handleNotFound);
+
   server.begin();
+  server.enableDelay(false); // Prevent handleClient() from locking main loop to 1000 Hz caused by delay(1) in handleClient()
+
+  host = strdup( device_id().c_str() );
 
   // $ avahi-browse -a
+  MDNS.begin(host);
   MDNS.addService("http", "tcp", 80);
 }
 
@@ -675,6 +769,7 @@ void setup() {
   }
 
   WiFi.begin(SSID, PASS);
+  WiFi.setSleep(true); // Wi-Fi ping latency 10ms -> 500ms
   system_state = STARTUP;
 }
 
@@ -701,7 +796,6 @@ R"===({
   Serial.println(buf);
 
   bool success = mqtt_client.publish(sensors_topic, buf);
-  Serial.println(success);
 
   free(ts);
   free(buf);
@@ -719,7 +813,7 @@ void visitors_handle() {
 void handle_led() {
   switch (system_state) {
     case STARTUP:
-      digitalWrite(LED_BUILTIN, millis() % 20 < 10);
+      digitalWrite(LED_BUILTIN, millis() % 200 < 100);
       break;
     case DEVICE_SETUP:
       digitalWrite(LED_BUILTIN, millis() % 2000 < 1000);
@@ -736,6 +830,19 @@ uint32_t wifi_last_ok = 0;
 void transition_to_setup() {
   WiFi.softAP("ESP32-LD2450");
   system_state = DEVICE_SETUP;
+}
+
+void measure_loop_rate() {
+  static uint64_t wakeups;
+  static uint32_t measure_at;
+
+  if (millis() >= measure_at) {
+    measure_at = millis() + 1000;
+    Serial.println(wakeups);
+    wakeups = 0;
+  }
+
+  wakeups++;
 }
 
 void loop() {
@@ -771,6 +878,7 @@ void loop() {
         ntp_init();
         tls_init();
         mqtt_init();
+        miniz_init();
         system_state = NORMAL_OPERATION;
       } else {
         if (long_time_no_wifi) {
@@ -784,4 +892,13 @@ void loop() {
 
   handle_led();
   handle_latest_frame();
+
+  //
+  // Using cpu_ll_waiti() to halt the CPU and slow the main loop down to 1000 Hz (systick) when the system is otherwise idle
+  //
+  // ESP-IDF implements this but only when all FreeRTOS tasks are blocked (which is never?), see ESP-IDF v4.4.7 source code
+  // components/freertos/port/xtensa/include/freertos/portmacro.h:#define vApplicationIdleHook esp_vApplicationIdleHook
+  // components/esp_system/freertos_hooks.c: void esp_vApplicationIdleHook(void)
+  //
+  cpu_ll_waiti();
 }
