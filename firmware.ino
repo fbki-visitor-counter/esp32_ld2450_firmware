@@ -382,6 +382,9 @@ void miniz_enqueue_frame(struct frame_t frame) {
   static char* dst;
   static char* next_out;
 
+  if (!p_deflator)
+    return;
+
   if (!dst) {
     dst = (char*)malloc(BLOCK_SIZE_LIMIT);
     avail_out = BLOCK_SIZE_LIMIT;
