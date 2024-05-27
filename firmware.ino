@@ -356,7 +356,7 @@ void ntp_init() {
 // MiniZ
 // ====================================================================================================================
 
-#define FRAMES_IN_BLOCK 20
+#define FRAMES_IN_BLOCK 30
 #define BLOCK_SIZE_LIMIT 1024
 
 tdefl_compressor* p_deflator = nullptr;
@@ -381,26 +381,40 @@ void miniz_enqueue_frame(struct frame_t frame) {
   static size_t avail_out;
   static char* dst;
   static char* next_out;
-  char src[256] = {0};
 
   if (!dst) {
-    avail_out = BLOCK_SIZE_LIMIT;
     dst = (char*)malloc(BLOCK_SIZE_LIMIT);
+    avail_out = BLOCK_SIZE_LIMIT;
     next_out = dst;
   }
-  
-  snprintf(src, 255, "%lf,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n", frame.ts,
-                                                                  frame.targets[0].x, frame.targets[0].y, frame.targets[0].speed, frame.targets[0].resolution,
-                                                                  frame.targets[1].x, frame.targets[1].y, frame.targets[1].speed, frame.targets[1].resolution,
-                                                                  frame.targets[2].x, frame.targets[2].y, frame.targets[2].speed, frame.targets[2].resolution );
 
-  size_t avail_in = strlen(src);
+  tdefl_status status;
+  char* next_in = (char*)&frame;
+  size_t avail_in = sizeof(frame_t);
+  size_t in_bytes;
   size_t out_bytes = avail_out;
 
-  tdefl_status status = tdefl_compress(p_deflator, src, &avail_in, next_out, &out_bytes, frames_placed < (FRAMES_IN_BLOCK - 1) ? TDEFL_NO_FLUSH : TDEFL_FINISH);
+  while (avail_in) {
+    in_bytes = avail_in;
 
-  next_out += out_bytes;
-  avail_out -= out_bytes;
+    status = tdefl_compress(p_deflator, next_in, &in_bytes, next_out, &out_bytes, frames_placed < (FRAMES_IN_BLOCK - 1) ? TDEFL_NO_FLUSH : TDEFL_FINISH);
+
+    next_in += in_bytes;
+    avail_in -= in_bytes;
+
+    next_out += out_bytes;
+    avail_out -= out_bytes;
+
+    if (status != TDEFL_STATUS_OKAY and status != TDEFL_STATUS_DONE) {
+      mqtt_client.publish(telemetry_topic, (String("compression error ") + int(status)).c_str());
+      break;
+    }
+
+    if (avail_out == 0) {
+      mqtt_client.publish(telemetry_topic, "compression ran out of space");
+      break;
+    }
+  }
 
   frames_placed++;
 
@@ -409,7 +423,7 @@ void miniz_enqueue_frame(struct frame_t frame) {
       size_t size = BLOCK_SIZE_LIMIT - avail_out;
       mqtt_client.publish(rawdata_topic, (uint8_t*)dst, size, true);
     } else {
-      mqtt_client.publish(telemetry_topic, "compression error");
+      mqtt_client.publish(telemetry_topic, "compression fin error");
     }
 
     free(dst);
