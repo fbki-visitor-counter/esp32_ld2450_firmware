@@ -497,7 +497,7 @@ static void mqtt_reconnect() {
 void mqtt_init() {
   Serial.print("MQTT startup\n");
 
-  String a = "axkuhta/" + device_id() + "/sensors";
+  String a = "axkuhta/" + device_id() + "/visitors4";
   String b = "axkuhta/" + device_id() + "/command";
   String c = "axkuhta/" + device_id() + "/rawdata";
   String d = "axkuhta/" + device_id() + "/telemetry";
@@ -802,10 +802,10 @@ void publish_visitors() {
   const char* fmt_str = 
 R"===({
   "device_timestamp": "%s",
-  "visitors_u": %d,
-  "visitors_d": %d,
-  "visitors_l": %d,
-  "visitors_r": %d
+  "u": %d,
+  "d": %d,
+  "l": %d,
+  "r": %d
 })===";
 
   snprintf(buf, 512, fmt_str, ts, visitors_u, visitors_d, visitors_l, visitors_r);
@@ -845,6 +845,7 @@ void handle_led() {
 uint32_t wifi_last_ok = 0;
 
 void transition_to_setup() {
+  // WiFi.disconnect(true); -- Combined AP+STA mode runs like garbage (ping 1000ms, PL 66%) when STA is not associated and scanning channels, but oh well
   WiFi.softAP("ESP32-LD2450");
   system_state = DEVICE_SETUP;
 }
