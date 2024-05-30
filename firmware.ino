@@ -52,6 +52,11 @@ String device_id() {
   return String("esp32_ld2450_") + mac_id;
 }
 
+uint32_t runtime_random_id;
+
+// https://github.com/espressif/arduino-esp32/blob/master/libraries/Insights/examples/DiagnosticsSmokeTest/DiagnosticsSmokeTest.ino
+RTC_NOINIT_ATTR static uint32_t warm_reset_count;
+
 // ====================================================================================================================
 // Non-volatile memory
 // ====================================================================================================================
@@ -424,7 +429,7 @@ void miniz_enqueue_frame(struct frame_t frame) {
   if (frames_placed == FRAMES_IN_BLOCK) {
     if (status == TDEFL_STATUS_DONE) {
       size_t size = BLOCK_SIZE_LIMIT - avail_out;
-      mqtt_client.publish(rawdata_topic, (uint8_t*)dst, size, true);
+      mqtt_client.publish(rawdata_topic, (uint8_t*)dst, size);
     } else {
       mqtt_client.publish(telemetry_topic, "compression fin error");
     }
@@ -485,7 +490,7 @@ static void mqtt_reconnect() {
   String client_id = device_id();
 
   if (mqtt_client.connect(client_id.c_str())) {
-    mqtt_client.publish(telemetry_topic, "hello");
+    // ...
   } else {
     //Serial.println("MQTT Fail");
   }
@@ -521,6 +526,10 @@ void mqtt_init() {
   Serial.println(rawdata_topic);
   Serial.print("Telemetry channel: ");
   Serial.println(telemetry_topic);
+
+  String telemetry_hello = String() + "hello\nwarm_reset_count=" + warm_reset_count + "\nfirmware=" __DATE__ " " __TIME__ "\n";
+
+  mqtt_client.publish(telemetry_topic, telemetry_hello.c_str());
 }
 
 // No delay required
@@ -773,6 +782,12 @@ void setup() {
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
 
+  if (esp_reset_reason() == ESP_RST_POWERON) {
+    warm_reset_count = 0;
+  } else {
+    warm_reset_count++;
+  }
+
   Serial.begin(921600);
 
   radar_init();
@@ -801,6 +816,7 @@ void publish_visitors() {
 
   const char* fmt_str = 
 R"===({
+  "runtime_random_id": %u,
   "device_timestamp": "%s",
   "u": %d,
   "d": %d,
@@ -808,11 +824,13 @@ R"===({
   "r": %d
 })===";
 
-  snprintf(buf, 512, fmt_str, ts, visitors_u, visitors_d, visitors_l, visitors_r);
+  snprintf(buf, 512, fmt_str, runtime_random_id, ts, visitors_u, visitors_d, visitors_l, visitors_r);
 
   Serial.println(buf);
 
-  bool success = mqtt_client.publish(sensors_topic, buf);
+  // True means "retain"
+  // A topic can have one sticky retained message
+  bool success = mqtt_client.publish(sensors_topic, buf, true);
 
   free(ts);
   free(buf);
@@ -882,8 +900,7 @@ void loop() {
       break;
     case DEVICE_SETUP:
       if (WiFi.status() == WL_CONNECTED) {
-        WiFi.softAPdisconnect(true);
-        system_state = NORMAL_OPERATION;
+        ESP.restart();
       } else {
         server.handleClient();
         nc_tcp_handle();
@@ -897,6 +914,7 @@ void loop() {
         tls_init();
         mqtt_init();
         miniz_init();
+        runtime_random_id = esp_random();
         system_state = NORMAL_OPERATION;
       } else {
         if (long_time_no_wifi) {
@@ -919,4 +937,5 @@ void loop() {
   // components/esp_system/freertos_hooks.c: void esp_vApplicationIdleHook(void)
   //
   cpu_ll_waiti();
+  delay(0);
 }
