@@ -61,7 +61,20 @@ RTC_NOINIT_ATTR static uint32_t warm_reset_count;
 // Non-volatile memory
 // ====================================================================================================================
 
+// Non-volatile checkpointed system state
+// Keep this below 256 bytes
+struct nv_snapshot_t {
+  struct {
+    uint32_t u;
+    uint32_t d;
+    uint32_t l;
+    uint32_t r;
+  } visitors;
+  uint32_t magic;
+} nv = {0};
+
 const String file_credentials = R"(/credentials.txt)";
+const String file_checkpoint = R"(/checkpoint.txt)";
 
 void littlefs_init() {
   if (!LittleFS.begin(true)) {
@@ -77,13 +90,8 @@ int read_credentials() {
   if(f){
     Serial.println("Found SSID, PASS.");
 
-    String mod = f.readString();
-
-    int i1 = mod.indexOf('\n',0);
-    int i2 = mod.indexOf('\n', i1+1);
-
-    SSID = strdup( mod.substring(0, i1-1).c_str() );
-    PASS = strdup( mod.substring(i1+1,i2-1).c_str() );
+    SSID = strdup( f.readStringUntil('\n').c_str() );
+    PASS = strdup( f.readStringUntil('\n').c_str() );
 
     Serial.print("[");
     Serial.print(SSID);
@@ -104,11 +112,41 @@ int read_credentials() {
 void save_credentials(String ssid_, String pass_) {
   File f = LittleFS.open(file_credentials, "w");  // open as a brand new file, discard old contents
   if (f) {
-    f.println(ssid_);
-    f.println(pass_);
+    f.printf("%s\n", ssid_.c_str());
+    f.printf("%s\n", pass_.c_str());
     f.close();
 
     Serial.println("Credentials saved.");
+  } else {
+    Serial.println("LittleFS error");
+
+    while (1) {}
+  }
+}
+
+int read_nv() {
+  File f = LittleFS.open(file_checkpoint, "r");
+  if (f) {
+    f.read((uint8_t*)&nv, sizeof(nv));
+    f.close();
+
+    if (nv.magic == 0x01010101)
+      return 1;
+  }
+
+  // Default state
+  nv = (struct nv_snapshot_t){
+    .magic = 0x01010101
+  };
+
+  return 0;
+}
+
+void save_nv() {
+  File f = LittleFS.open(file_checkpoint, "w");
+  if (f) {
+    f.write((uint8_t*)&nv, sizeof(nv));
+    f.close();
   } else {
     Serial.println("LittleFS error");
 
@@ -233,6 +271,13 @@ public:
         }
         break;
     }
+  }
+
+  void clear() {
+    count_u = 0;
+    count_d = 0;
+    count_l = 0;
+    count_r = 0;
   }
 };
 
@@ -792,6 +837,7 @@ void setup() {
 
   radar_init();
   littlefs_init();
+  read_nv();
 
   if (!read_credentials()) {
     transition_to_setup();
@@ -809,11 +855,6 @@ void publish_visitors() {
   char* buf = (char*)malloc(512);
   char* ts = timestamp();
 
-  int visitors_u = machines[0].count_u + machines[1].count_u + machines[2].count_u;
-  int visitors_d = machines[0].count_d + machines[1].count_d + machines[2].count_d;
-  int visitors_l = machines[0].count_l + machines[1].count_l + machines[2].count_l;
-  int visitors_r = machines[0].count_r + machines[1].count_r + machines[2].count_r;
-
   const char* fmt_str = 
 R"===({
   "runtime_random_id": %u,
@@ -824,24 +865,32 @@ R"===({
   "r": %d
 })===";
 
-  snprintf(buf, 512, fmt_str, runtime_random_id, ts, visitors_u, visitors_d, visitors_l, visitors_r);
+  snprintf(buf, 512, fmt_str, runtime_random_id, ts, nv.visitors.u, nv.visitors.d, nv.visitors.l, nv.visitors.r);
 
-  Serial.println(buf);
-
-  // True means "retain"
-  // A topic can have one sticky retained message
-  bool success = mqtt_client.publish(sensors_topic, buf, true);
+  bool success = mqtt_client.publish(sensors_topic, buf);
 
   free(ts);
   free(buf);
 }
 
+// Save counters to flash every 30 seconds
+// Since LittleFS has wear leveling we don't really have to worry about flash endurance
 void visitors_handle() {
   static uint32_t publish_at;
 
   if (millis() >= publish_at) {
+    nv.visitors.u += machines[0].count_u + machines[1].count_u + machines[2].count_u;
+    nv.visitors.d += machines[0].count_d + machines[1].count_d + machines[2].count_d;
+    nv.visitors.l += machines[0].count_l + machines[1].count_l + machines[2].count_l;
+    nv.visitors.r += machines[0].count_r + machines[1].count_r + machines[2].count_r;
+
+    machines[0].clear();
+    machines[1].clear();
+    machines[2].clear();
+
+    save_nv();
     publish_visitors();
-    publish_at += 10000;
+    publish_at += 30000;
   }
 }
 
