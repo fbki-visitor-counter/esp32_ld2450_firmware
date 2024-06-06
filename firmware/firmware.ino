@@ -124,19 +124,21 @@ void save_credentials(String ssid_, String pass_) {
   }
 }
 
+#define NV_VERSION 0x01010102
+
 int read_nv() {
   File f = LittleFS.open(file_checkpoint, "r");
   if (f) {
     f.read((uint8_t*)&nv, sizeof(nv));
     f.close();
 
-    if (nv.magic == 0x01010101)
+    if (nv.magic == NV_VERSION)
       return 1;
   }
 
   // Default state
   nv = (struct nv_snapshot_t){
-    .magic = 0x01010101
+    .magic = NV_VERSION
   };
 
   return 0;
@@ -230,6 +232,9 @@ void read_ld2450_frame() {
     latest_frame.targets[i].y = y_ & 0x8000 ? y_ - 0x8000 : -y_;
     latest_frame.targets[i].speed = speed_ & 0x8000 ? speed_ - 0x8000 : -speed_;
     latest_frame.targets[i].resolution = d_resolution_;
+
+    // Flip x because we have the radar upside down (whoops)
+    latest_frame.targets[i].x = -latest_frame.targets[i].x;
   }
 }
 
