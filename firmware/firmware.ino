@@ -156,6 +156,11 @@ void save_nv() {
   }
 }
 
+void factory_reset() {
+  LittleFS.remove(file_credentials);
+  LittleFS.remove(file_checkpoint);
+}
+
 // ====================================================================================================================
 // LD2450
 // ====================================================================================================================
@@ -734,7 +739,11 @@ static const char root_page[] = R"===(
         <form method="POST" action="/api/update" enctype="multipart/form-data">
           <input type="file" name="update">
           <input type="submit" value="Update">
-        </form><br>
+        </form>
+        <h2>Danger zone</h2>
+        <form method="GET" action="/api/reset">
+          <input type="submit" value="Factory reset">
+        </form>
       </div>
     </div>
     <div class="footer">
@@ -803,10 +812,18 @@ void handle_update_upload() {
   }
 }
 
+void handle_reset() {
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/plain", "OK");
+  factory_reset();
+  ESP.restart();
+}
+
 void http_server_init() {
   server.on("/", handle_root);
   server.on("/api/setup", handle_setup);
   server.on("/api/update", HTTP_POST, handle_update, handle_update_upload);
+  server.on("/api/reset", handle_reset);
 
   server.onNotFound(handleNotFound);
 
