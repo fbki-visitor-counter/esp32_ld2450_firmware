@@ -684,7 +684,7 @@ void nc_tcp_enqueue_frame(struct frame_t frame) {
 // https://github.com/espressif/arduino-esp32/blob/master/libraries/HTTPUpdateServer/examples/WebUpdater/WebUpdater.ino
 //
 
-static const char root_page[] = R"===(
+static const char root_page_template[] = R"===(
 <!DOCTYPE html>
 <html>
   <head>
@@ -749,6 +749,7 @@ static const char root_page[] = R"===(
     <div class="footer">
       <div class="container">
         <p>Firmware version: )===" __DATE__ " " __TIME__ R"===(</p>
+        <p>Device ID: %s</p>
       </div>
     </div>
     </main>
@@ -757,7 +758,14 @@ static const char root_page[] = R"===(
 )===";
 
 void handle_root() {
+  size_t root_page_allocation_size = sizeof(root_page_template) + 512;
+  char* root_page = (char*)malloc(root_page_allocation_size);
+
+  snprintf(root_page, root_page_allocation_size, root_page_template, device_id().c_str());
+
   server.send(200, "text/html", root_page);
+
+  free(root_page);
 }
 
 void handleNotFound() {
